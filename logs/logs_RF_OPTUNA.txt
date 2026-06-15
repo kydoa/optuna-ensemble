@@ -1,0 +1,40 @@
+======================================================================
+INICIANDO PIPELINE DE ENSEMBLE (PARALELIZADO: SOFT VOTING + OPTUNA 135 TRIALS)
+======================================================================
+[>] Iniciando processamento da feature: vggish
+[>] Iniciando processamento da feature: trill
+[>] Iniciando processamento da feature: Lexical_Full
+[>] Iniciando processamento da feature: pAA
+[>] Iniciando processamento da feature: ComParE_2016_6k
+[>] Iniciando processamento da feature: eGeMAPSv02_88
+[>] Iniciando processamento da feature: SpeechGraph_Full
+    [OK] Feature SpeechGraph_Full finalizada!
+    [OK] Feature pAA finalizada!
+    [OK] Feature trill finalizada!
+    [OK] Feature eGeMAPSv02_88 finalizada!
+    [OK] Feature vggish finalizada!
+    [OK] Feature Lexical_Full finalizada!
+    [OK] Feature ComParE_2016_6k finalizada!
+
+======================================================================
+FASE FINAL: ALINHAMENTO E MÉDIA (SOFT VOTING)
+======================================================================
+[INFO] Pacientes na interseção total: 70
+
+======================================================================
+RESULTADO DO ENSEMBLE (Soft Voting)
+======================================================================
+Acurácia Global do Ensemble: 0.6429
+----------------------------------------------------------------------
+Relatório de Classificação:
+              precision    recall  f1-score   support
+
+          HC       0.65      0.63      0.64        35
+          AD       0.64      0.66      0.65        35
+
+    accuracy                           0.64        70
+   macro avg       0.64      0.64      0.64        70
+weighted avg       0.64      0.64      0.64        70
+
+======================================================================
+

@@ -1,0 +1,46 @@
+======================================================================
+INICIANDO PIPELINE DE ENSEMBLE (LIGHTGBM + OPTUNA 135 TRIALS)
+======================================================================
+[INFO] Distributing 7 features to CPU cores...
+[>] Processing: vggish
+[>] Processing: trill
+[>] Processing: Lexical_Full
+[>] Processing: ComParE_2016_6k
+[>] Processing: eGeMAPSv02_88
+[>] Processing: SpeechGraph_Full
+[>] Processing: pAA
+    [i] High-dim detected (2048 features) on trill. Applying fast filtering...
+    [i] Optimized matrix shape for LightGBM: (166, 29)
+    [i] High-dim detected (6373 features) on ComParE_2016_6k. Applying fast filtering...
+    [i] Optimized matrix shape for LightGBM: (166, 200)
+    [OK] Feature SpeechGraph_Full finalized!
+    [OK] Feature trill finalized!
+    [OK] Feature Lexical_Full finalized!
+    [OK] Feature eGeMAPSv02_88 finalized!
+    [OK] Feature pAA finalized!
+    [OK] Feature vggish finalized!
+    [OK] Feature ComParE_2016_6k finalized!
+
+[INFO] Aggregating results...
+
+======================================================================
+FASE FINAL: ALINHAMENTO E MÉDIA (SOFT VOTING)
+======================================================================
+[INFO] Pacientes na interseção total: 70
+
+======================================================================
+RESULTADO DO ENSEMBLE (Soft Voting)
+======================================================================
+Acurácia Global do Ensemble: 0.7143
+----------------------------------------------------------------------
+Relatório de Classificação:
+              precision    recall  f1-score   support
+
+          HC       0.73      0.69      0.71        35
+          AD       0.70      0.74      0.72        35
+
+    accuracy                           0.71        70
+   macro avg       0.71      0.71      0.71        70
+weighted avg       0.71      0.71      0.71        70
+
+======================================================================
