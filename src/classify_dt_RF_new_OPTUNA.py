@@ -1,12 +1,11 @@
 import os
 import numpy as np
 from pathlib import Path
-from sklearn.tree import DecisionTreeClassifier
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import classification_report, accuracy_score
-from sklearn.model_selection import cross_val_score  # Necessário para o Optuna
-from sklearn.feature_selection import VarianceThreshold, SelectKBest, f_classif  # Otimizadores de matriz
-import optuna  # Necessário: pip install optuna
+from sklearn.model_selection import cross_val_score
+from sklearn.preprocessing import Normalizer, StandardScaler  # IMPORTANTE: Adicionado StandardScaler
+import optuna
 import pandas as pd
 
 # 1. Importação necessária para o paralelismo
@@ -27,23 +26,23 @@ DATA_TEST     = 'ADReSSo21_test'
 def objective(trial, X_train, y_train):
     """
     Função objetivo para o Optuna.
-    Sugere hiperparâmetros para o Random Forest e avalia via Cross-Validation rápido.
+    Sugere hiperparâmetros para o Random Forest e avalia via Cross-Validation.
     """
     param = {
-        'n_estimators': trial.suggest_int('n_estimators', 50, 150),     # Reduzido o teto de 300 para 150 para acelerar os 135 trials
-        'max_depth': trial.suggest_int('max_depth', 4, 15),             # Ajustado teto de 50 para 15 evitando árvores infinitas no ComParE
+        'n_estimators': trial.suggest_int('n_estimators', 50, 150),
+        'max_depth': trial.suggest_int('max_depth', 4, 15),
         'min_samples_split': trial.suggest_int('min_samples_split', 2, 20),
         'min_samples_leaf': trial.suggest_int('min_samples_leaf', 1, 10),
         'max_features': trial.suggest_categorical('max_features', ['sqrt', 'log2']),
         'class_weight': 'balanced',
         'random_state': 42,
-        'n_jobs': 1  # Mantido em 1 pois as pastas rodarão em paralelo externo
+        'n_jobs': 1  # Mantido em 1 para não colidir com o ProcessPoolExecutor externo
     }
 
     clf = RandomForestClassifier(**param)
 
-    # Reduzido de cv=5 para cv=3 para ganho de velocidade de processamento linear
-    score = cross_val_score(clf, X_train, y_train, cv=3, scoring='accuracy').mean()
+    # AJUSTADO: cv=4 e scoring='accuracy' para encontrar os melhores hiperparâmetros
+    score = cross_val_score(clf, X_train, y_train, cv=4, scoring='accuracy', n_jobs=1).mean()
     return score
 
 # --- FUNÇÕES DE CARREGAMENTO E PROCESSAMENTO ---
@@ -77,7 +76,11 @@ def load_data_for_feature_set(feature_folder, dataset_name):
             if file.endswith('.npy'):
                 try:
                     data = np.load(os.path.join(root, file)).flatten().astype(np.float32)
-                    if np.isnan(data).all(): continue
+
+                    # Se houver qualquer dado nulo (NaN), ignora a amostra (Sem Imputer)
+                    if np.isnan(data).any():
+                        continue
+
                     features.append(data)
                     ids.append(Path(file).stem)
                     labels.append(current_label)
@@ -87,7 +90,7 @@ def load_data_for_feature_set(feature_folder, dataset_name):
     return np.array(features), np.array(labels), ids
 
 def process_single_feature_set(feature_folder, train_ds, test_ds):
-    """Treina com Tunagem Optuna e extrai probabilidades do teste."""
+    """Normaliza embeddings/features, treina com Tunagem Optuna e extrai probabilidades do teste."""
     print(f"[>] Iniciando processamento da feature: {feature_folder}")
     X_train, y_train, _ = load_data_for_feature_set(feature_folder, train_ds)
 
@@ -96,24 +99,23 @@ def process_single_feature_set(feature_folder, train_ds, test_ds):
         return {}, {}
 
     X_test, y_test, test_ids = load_data_for_feature_set(feature_folder, test_ds)
-    if len(X_test) == 0:
+    if len(X_test) == 0 or X_test.shape[1] != X_train.shape[1]:
         return {}, {}
 
-    # --- DEFENSOR DE ALTA DIMENSIONALIDADE (Prevenção física para o ComParE_2016_6k) ---
-    if X_train.shape[1] > 500:
-        print(f"    [i] Alta dimensão detectada ({X_train.shape[1]} colunas). Aplicando seleção...")
+    # --- TRATAMENTO E ESCALONAMENTO CONDICIONAL DOS DADOS ---
+    # Heurística para detectar se a pasta refere-se a embeddings
+    feat_folder_lower = feature_folder.lower()
+    is_embedding = any(kw in feat_folder_lower for kw in ['embed', 'w2v', 'bert', 'hubert', 'wav2vec', 'gpt', 'llama', 'vector'])
 
-        # 1. Limpeza de variância morta
-        selector_var = VarianceThreshold(threshold=0.01)
-        X_train = selector_var.fit_transform(X_train)
-        X_test = selector_var.transform(X_test)
+    if is_embedding:
+        print(f"    [Scalers] Aplicando Normalizer (Embeddings) em: {feature_folder}")
+        scaler = Normalizer()
+    else:
+        print(f"    [Scalers] Aplicando StandardScaler (Features) em: {feature_folder}")
+        scaler = StandardScaler()
 
-        # 2. Seleção ANOVA estatística instantânea para entregar 100 features limpas
-        k_features = min(100, X_train.shape[1])
-        selector_k = SelectKBest(score_func=f_classif, k=k_features)
-        X_train = selector_k.fit_transform(X_train, y_train)
-        X_test = selector_k.transform(X_test)
-        print(f"    [i] Matriz otimizada para a Random Forest: {X_train.shape}")
+    X_train = scaler.fit_transform(X_train)
+    X_test = scaler.transform(X_test)
 
     # --- INÍCIO DA TUNAGEM COM OPTUNA ---
     study = optuna.create_study(
@@ -131,8 +133,8 @@ def process_single_feature_set(feature_folder, train_ds, test_ds):
 
     classes = clf.classes_
     try:
-        ad_idx = np.where(classes == 'AD')[0][0]
-    except IndexError:
+        ad_idx = list(classes).index('AD')
+    except (IndexError, ValueError):
         print(f"    [!] Aviso: Classe 'AD' não encontrada em {feature_folder}.")
         return {}, {}
 
@@ -217,9 +219,6 @@ def run_pipeline():
                 final_ground_truth.append(true_val)
                 ids_intersecao.append(p_id)
 
-    # ==========================================================================
-    # SUPORTE AO JUPYTER NOTBOOK ADICIONADO AQUI
-    # ==========================================================================
     if final_predictions:
         df_results = pd.DataFrame({
             'Patient_ID': ids_intersecao,
@@ -228,7 +227,6 @@ def run_pipeline():
         })
         df_results.to_csv('/home/dani/Documentos/PEP/ensemble_results_RF.csv', index=False)
         print("[INFO] Resultados exportados com sucesso em 'ensemble_results_RF.csv'!")
-    # ==========================================================================
 
     if not final_predictions:
         print("[!] Erro: Nenhum paciente comum encontrado.")

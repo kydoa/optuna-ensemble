@@ -4,13 +4,10 @@ from pathlib import Path
 from sklearn.svm import SVC
 from sklearn.metrics import classification_report, accuracy_score
 from sklearn.model_selection import cross_val_score
-from sklearn.impute import SimpleImputer
-from sklearn.pipeline import Pipeline
-from sklearn.feature_selection import VarianceThreshold, SelectKBest, f_classif # Otimizadores de matriz
+from sklearn.preprocessing import Normalizer, StandardScaler  # IMPORTANTE: Adicionado StandardScaler
 import optuna
-# Import for parallel processing
+# Import para processamento paralelo
 from joblib import Parallel, delayed
-from sklearn.preprocessing import StandardScaler
 import pandas as pd
 
 # Desativar os logs verbosos do Optuna para manter a saída paralela organizada
@@ -26,7 +23,7 @@ DATA_TEST     = 'ADReSSo21_test'
 # --- TUNING FUNCTION (OPTUNA) ---
 def objective(trial, X_train, y_train):
     param = {
-        'C': trial.suggest_float('C', 1e-3, 100, log=True),
+        'C': trial.suggest_float('C', 1e-3, 135, log=True),
         'gamma': trial.suggest_categorical('gamma', ['scale', 'auto']),
         # Removido 'poly' do espaço de busca pois gera loops infinitos em matrizes de áudio complexas
         'kernel': trial.suggest_categorical('kernel', ['rbf', 'sigmoid']),
@@ -35,15 +32,11 @@ def objective(trial, X_train, y_train):
         'random_state': 42
     }
 
-    # O Pipeline interno lida apenas com o classificador pós-filtrado
-    model_pipeline = Pipeline([
-        ('imputer', SimpleImputer(strategy='mean')),
-        ('scaler', StandardScaler()),
-        ('svc', SVC(**param))
-    ])
+    clf = SVC(**param)
 
-    # Reduzido de cv=5 para cv=3 para viabilizar as 135 iterações sem travar a CPU
-    score = cross_val_score(model_pipeline, X_train, y_train, cv=3, scoring='accuracy').mean()
+    # AJUSTADO: Executa com CV=4, buscando otimizar stritamente a ACCURACY.
+    # Travado n_jobs=1 para evitar conflito com o processamento paralelo superior do Joblib.
+    score = cross_val_score(clf, X_train, y_train, cv=4, scoring='accuracy', n_jobs=1).mean()
     return score
 
 # --- DATA LOADING AND PROCESSING ---
@@ -75,7 +68,11 @@ def load_data_for_feature_set(feature_folder, dataset_name):
             if file.endswith('.npy'):
                 try:
                     data = np.load(os.path.join(root, file)).flatten().astype(np.float32)
-                    if np.isnan(data).all(): continue
+
+                    # CORREÇÃO: Removido SimpleImputer. Se houver NaN, a amostra é descartada aqui.
+                    if np.isnan(data).any():
+                        continue
+
                     features.append(data)
                     ids.append(Path(file).stem)
                     labels.append(current_label)
@@ -89,31 +86,22 @@ def process_single_feature_set(feature_folder, train_ds, test_ds):
     if len(X_train) == 0 or len(np.unique(y_train)) < 2: return None
 
     X_test, y_test, test_ids = load_data_for_feature_set(feature_folder, test_ds)
-    if len(X_test) == 0: return None
+    if len(X_test) == 0 or X_test.shape[1] != X_train.shape[1]: return None
 
-    # Preprocessing setup inicial
-    imputer = SimpleImputer(strategy='mean')
-    scaler = StandardScaler()
+    # --- TRATAMENTO E ESCALONAMENTO CONDICIONAL DOS DADOS ---
+    # Heurística para detectar se a pasta refere-se a embeddings
+    feat_folder_lower = feature_folder.lower()
+    is_embedding = any(kw in feat_folder_lower for kw in ['embed', 'w2v', 'bert', 'hubert', 'wav2vec', 'gpt', 'llama', 'vector'])
 
-    X_train_transformed = imputer.fit_transform(X_train)
-    X_train_transformed = scaler.fit_transform(X_train_transformed)
+    if is_embedding:
+        print(f"    [Scalers] Aplicando Normalizer (Embeddings) em: {feature_folder}")
+        scaler = Normalizer()
+    else:
+        print(f"    [Scalers] Aplicando StandardScaler (Features) em: {feature_folder}")
+        scaler = StandardScaler()
 
-    X_test_transformed = imputer.transform(X_test)
-    X_test_transformed = scaler.transform(X_test_transformed)
-
-    # --- DEFENSOR DE PERFORMANCE (Barreira Física para os 135 Trials no ComParE_2016_6k) ---
-    if X_train_transformed.shape[1] > 500:
-        print(f"    [i] Alta dimensão detectada no SVC ({X_train_transformed.shape[1]} colunas). Filtrando...")
-
-        selector_var = VarianceThreshold(threshold=0.01)
-        X_train_transformed = selector_var.fit_transform(X_train_transformed)
-        X_test_transformed = selector_var.transform(X_test_transformed)
-
-        k_features = min(100, X_train_transformed.shape[1])
-        selector_k = SelectKBest(score_func=f_classif, k=k_features)
-        X_train_transformed = selector_k.fit_transform(X_train_transformed, y_train)
-        X_test_transformed = selector_k.transform(X_test_transformed)
-        print(f"    [i] Matriz reduzida para o SVC: {X_train_transformed.shape}")
+    X_train_transformed = scaler.fit_transform(X_train)
+    X_test_transformed = scaler.transform(X_test)
 
     # --- INÍCIO DA TUNAGEM COM OPTUNA ---
     study = optuna.create_study(
@@ -122,6 +110,7 @@ def process_single_feature_set(feature_folder, train_ds, test_ds):
         pruner=optuna.pruners.MedianPruner(n_startup_trials=5, n_warmup_steps=1)
     )
 
+    # Passa a matriz previamente e unicamente normalizada para o objective
     study.optimize(lambda trial: objective(trial, X_train_transformed, y_train), n_trials=135)
     # --- FIM DA TUNAGEM ---
 
@@ -130,8 +119,8 @@ def process_single_feature_set(feature_folder, train_ds, test_ds):
     clf.fit(X_train_transformed, y_train)
 
     try:
-        ad_idx = np.where(clf.classes_ == 'AD')[0][0]
-    except IndexError:
+        ad_idx = list(clf.classes_).index('AD')
+    except (IndexError, ValueError):
         print(f"[!] Error: 'AD' class not found in model classes for {feature_folder}")
         return None
 
@@ -151,6 +140,10 @@ def run_pipeline():
     print("="*70)
     print("STARTING SVC ENSEMBLE PIPELINE (PARALLEL + SOFT VOTING + OPTUNA 135 TRIALS)")
     print("="*70)
+
+    if not BASE_FEATURES_DIR.exists():
+        print(f"[!] Diretório base não existe: {BASE_FEATURES_DIR}")
+        return
 
     all_features = [f for f in os.listdir(BASE_FEATURES_DIR)
                     if os.path.isdir(BASE_FEATURES_DIR.joinpath(f))]

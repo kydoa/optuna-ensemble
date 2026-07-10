@@ -3,7 +3,7 @@ import numpy as np
 import xgboost as xgb
 from pathlib import Path
 from sklearn.metrics import classification_report, accuracy_score
-from sklearn.feature_selection import VarianceThreshold, SelectKBest, f_classif
+from sklearn.preprocessing import Normalizer, StandardScaler  # IMPORTANTE: Adicionado StandardScaler
 import optuna
 import pandas as pd
 from joblib import Parallel, delayed
@@ -20,36 +20,39 @@ DATA_TEST     = 'ADReSSo21_test'
 
 # --- FUNÇÃO DE TUNAGEM (OPTUNA) ---
 def objective(trial, X_train, y_train):
-    if len(X_train) <= 3:
+    if len(X_train) <= 4:  # Ajustado para o limite do novo CV=4
         return 0.0
 
     dtrain = xgb.DMatrix(X_train, label=y_train)
 
     param = {
-        'max_depth': trial.suggest_int('max_depth', 3, 6), # Capped at 6 for high-dim stability
+        'max_depth': trial.suggest_int('max_depth', 3, 6),
         'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.3, log=True),
         'subsample': trial.suggest_float('subsample', 0.6, 1.0),
         'colsample_bytree': trial.suggest_float('colsample_bytree', 0.6, 1.0),
         'gamma': trial.suggest_float('gamma', 1e-8, 1.0, log=True),
-        'eval_metric': 'logloss',
+        # 'error' calcula a taxa de erro de classificação (1 - acurácia)
+        'eval_metric': 'error',
         'random_state': 42,
         'n_jobs': 1
     }
 
-    num_boost_round = trial.suggest_int('n_estimators', 50, 150) # Capped at 150 to fly through ComParE
+    num_boost_round = trial.suggest_int('n_estimators', 50, 150)
 
     try:
+        # AJUSTADO: nfold=4 e focado na otimização da acurácia via taxa de erro
         cv_results = xgb.cv(
             param,
             dtrain,
             num_boost_round=num_boost_round,
-            nfold=3,
+            nfold=4,
             stratified=True,
             early_stopping_rounds=10,
             seed=42
         )
-        best_score = 1.0 - cv_results['test-logloss-mean'].iloc[-1]
-        return best_score
+        # Transforma a taxa de erro final de teste em acurácia (1.0 - erro)
+        best_accuracy = 1.0 - cv_results['test-error-mean'].iloc[-1]
+        return best_accuracy
     except Exception:
         return 0.0
 
@@ -90,7 +93,9 @@ def load_data_for_feature_set(feature_folder, dataset_name):
                     elif data.size != expected_dim:
                         continue
 
-                    if np.isnan(data).all(): continue
+                    # CORREÇÃO: Sem Imputer. Se houver qualquer NaN, a amostra é descartada aqui.
+                    if np.isnan(data).any():
+                        continue
 
                     features.append(data)
                     ids.append(Path(file).stem)
@@ -107,7 +112,7 @@ def process_single_feature_set(feature_folder, train_ds, test_ds):
     print(f"[>] Processing {feature_folder}")
 
     X_train, y_train, _ = load_data_for_feature_set(feature_folder, train_ds)
-    if len(X_train) <= 3 or len(np.unique(y_train)) < 2:
+    if len(X_train) <= 4 or len(np.unique(y_train)) < 2:
         print(f"    [!] Skipping {feature_folder}: Insufficient samples.")
         return None
 
@@ -115,19 +120,20 @@ def process_single_feature_set(feature_folder, train_ds, test_ds):
     if len(X_test) == 0 or X_test.shape[1] != X_train.shape[1]:
         return None
 
-    # --- DEFENSOR DE PERFORMANCE: FILTRO PARA ALTA DIMENSIONALIDADE ---
-    if X_train.shape[1] > 500:
-        print(f"    [i] High-dim detected ({X_train.shape[1]} features). Applying fast filtering...")
+    # --- TRATAMENTO E ESCALONAMENTO CONDICIONAL DOS DADOS ---
+    # Heurística para detectar se a pasta refere-se a embeddings
+    feat_folder_lower = feature_folder.lower()
+    is_embedding = any(kw in feat_folder_lower for kw in ['embed', 'w2v', 'bert', 'hubert', 'wav2vec', 'gpt', 'llama', 'vector'])
 
-        selector_var = VarianceThreshold(threshold=0.01)
-        X_train = selector_var.fit_transform(X_train)
-        X_test = selector_var.transform(X_test)
+    if is_embedding:
+        print(f"    [Scalers] Aplicando Normalizer (Embeddings) em: {feature_folder}")
+        scaler = Normalizer()
+    else:
+        print(f"    [Scalers] Aplicando StandardScaler (Features) em: {feature_folder}")
+        scaler = StandardScaler()
 
-        k_features = min(200, X_train.shape[1])
-        selector_k = SelectKBest(score_func=f_classif, k=k_features)
-        X_train = selector_k.fit_transform(X_train, y_train)
-        X_test = selector_k.transform(X_test)
-        print(f"    [i] Successfully optimized matrix shape to: {X_train.shape}")
+    X_train_transformed = scaler.fit_transform(X_train)
+    X_test_transformed = scaler.transform(X_test)
 
     # --- INÍCIO DA TUNAGEM COM OPTUNA ---
     study = optuna.create_study(
@@ -136,13 +142,23 @@ def process_single_feature_set(feature_folder, train_ds, test_ds):
         pruner=optuna.pruners.MedianPruner(n_startup_trials=5, n_warmup_steps=1)
     )
 
-    study.optimize(lambda trial: objective(trial, X_train, y_train), n_trials=135)
+    study.optimize(lambda trial: objective(trial, X_train_transformed, y_train), n_trials=135)
     # --- FIM DA TUNAGEM ---
 
-    clf = XGBClassifier(**study.best_params, eval_metric='logloss', random_state=42, n_jobs=1)
-    clf.fit(X_train, y_train)
+    # Extrai e formata os melhores parâmetros encontrados pelo Optuna
+    best_params = study.best_params.copy()
+    n_estimators = best_params.pop('n_estimators', 135)
 
-    probs = clf.predict_proba(X_test)
+    clf = XGBClassifier(
+        n_estimators=n_estimators,
+        **best_params,
+        eval_metric='logloss',
+        random_state=42,
+        n_jobs=1
+    )
+    clf.fit(X_train_transformed, y_train)
+
+    probs = clf.predict_proba(X_test_transformed)
     prob_dict, label_dict = {}, {}
     for i in range(len(test_ids)):
         p_id = test_ids[i]
@@ -165,7 +181,6 @@ def run_pipeline():
 
     print(f"[INFO] Distributing {len(all_features)} features to CPU cores...")
 
-    # Alterado backend para 'loky' (multiprocessing padrão) para contornar o travamento do GIL em threads
     results = Parallel(n_jobs=-1, backend="loky")(
         delayed(process_single_feature_set)(feat, DATASET_TRAIN, DATA_TEST)
         for feat in all_features
@@ -218,7 +233,10 @@ def run_pipeline():
         print("[!] Erro: Nenhum paciente comum encontrado.")
         return
 
+    print(f"[INFO] Pacientes na interseção total: {len(ids_intersecao)}")
     print("\n" + "="*70)
+    print("RESULTADO DO ENSEMBLE (Soft Voting)")
+    print("="*70)
     print(f"Acurácia Global do Ensemble: {accuracy_score(final_ground_truth, final_predictions):.4f}")
     print("-" * 70)
     print("Relatório de Classificação:")

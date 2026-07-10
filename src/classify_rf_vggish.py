@@ -1,17 +1,14 @@
 import os
 import numpy as np
 from pathlib import Path
-from sklearn.tree import DecisionTreeClassifier
+from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import classification_report, accuracy_score
 from sklearn.model_selection import cross_val_score
-from sklearn.preprocessing import Normalizer, StandardScaler # IMPORTANTE: Adicionado StandardScaler
+from sklearn.preprocessing import Normalizer, StandardScaler
 import optuna
 import pandas as pd
 
-# Importações necessárias para o paralelismo de processos
-from concurrent.futures import ProcessPoolExecutor, as_completed
-
-# Desativar os logs verbosos do Optuna para manter a saída paralela limpa
+# Desativar os logs verbosos do Optuna para manter a saída limpa
 optuna.logging.set_verbosity(optuna.logging.WARNING)
 
 # ==============================================================================
@@ -22,28 +19,31 @@ BASE_FEATURES_DIR = Path('/home/dani/Documentos/PEP/admodel-master-version/data/
 DATASET_TRAIN = 'ADReSSo21_train'
 DATA_TEST = 'ADReSSo21_test'
 
+# Alterado para a feature alvo solicitada
+FEATURE_TARGET = 'vggish'
+
 # --- FUNÇÃO DE TUNAGEM (OPTUNA) ---
 
 def objective(trial, X_train, y_train):
     """
     Função objetivo para o Optuna.
-    Sugere hiperparâmetros e avalia a performance usando Cross-Validation com accuracy.
+    Sugere hiperparâmetros para o Random Forest e avalia via Cross-Validation.
     """
     param = {
-        'criterion': trial.suggest_categorical('criterion', ['gini', 'entropy']),
-        'max_depth': trial.suggest_int('max_depth', 2, 10),
+        'n_estimators': trial.suggest_int('n_estimators', 50, 150),
+        'max_depth': trial.suggest_int('max_depth', 4, 15),
         'min_samples_split': trial.suggest_int('min_samples_split', 2, 20),
         'min_samples_leaf': trial.suggest_int('min_samples_leaf', 1, 10),
+        'max_features': trial.suggest_categorical('max_features', ['sqrt', 'log2']),
         'class_weight': 'balanced',
         'random_state': 42
     }
 
-    clf = DecisionTreeClassifier(**param)
+    clf = RandomForestClassifier(**param)
 
     # Executa o Cross-Validation com CV=4 buscando otimizar a ACCURACY.
-    # O n_jobs é controlado aqui no CV. Para evitar sobrecarga no ProcessPoolExecutor externo,
-    # limitamos a 1 núcleo por árvore, permitindo que a paralelização seja feita por pasta/feature.
-    score = cross_val_score(clf, X_train, y_train, cv=4, scoring='accuracy', n_jobs=1).mean()
+    # Usamos n_jobs=-1 aqui já que estamos rodando apenas uma única feature e não há paralelismo externo.
+    score = cross_val_score(clf, X_train, y_train, cv=4, scoring='accuracy', n_jobs=-1).mean()
     return score
 
 # --- FUNÇÕES DE CARREGAMENTO E PROCESSAMENTO ---
@@ -77,7 +77,7 @@ def load_data_for_feature_set(feature_folder, dataset_name):
                 try:
                     data = np.load(os.path.join(root, file)).flatten().astype(np.float32)
 
-                    # CORREÇÃO: Removido qualquer Imputer. Se houver NaN, o dado é simplesmente ignorado.
+                    # CORREÇÃO: Se houver NaN, o dado é simplesmente ignorado.
                     if np.isnan(data).any():
                         continue
 
@@ -89,25 +89,26 @@ def load_data_for_feature_set(feature_folder, dataset_name):
     return np.array(features), np.array(labels), ids
 
 def process_single_feature_set(feature_folder, train_ds, test_ds):
-    """Normaliza, treina com Optuna e extrai probabilidades do teste."""
+    """Normaliza, treina com Optuna (Random Forest) e extrai predições do teste para exportação."""
     print(f"[>] Iniciando processamento da feature: {feature_folder}")
     X_train, y_train, _ = load_data_for_feature_set(feature_folder, train_ds)
 
     if len(X_train) == 0 or len(np.unique(y_train)) < 2:
         print(f" [!] Erro: Sem dados suficientes para {feature_folder}")
-        return {}, {}
+        return None, None, None
 
     X_test, y_test, test_ids = load_data_for_feature_set(feature_folder, test_ds)
     if len(X_test) == 0 or X_test.shape[1] != X_train.shape[1]:
-        return {}, {}
+        print(f" [!] Erro: Dados de teste ausentes ou incompatíveis para {feature_folder}")
+        return None, None, None
 
     # --- TRATAMENTO E ESCALONAMENTO CONDICIONAL DOS DADOS ---
-    # Heurística para detectar se a pasta refere-se a embeddings
     feat_folder_lower = feature_folder.lower()
-    is_embedding = any(kw in feat_folder_lower for kw in ['embed', 'w2v', 'bert', 'hubert', 'wav2vec', 'gpt', 'llama', 'vector'])
+    # Adicionado 'vggish' explicitamente no mapeamento de embeddings de áudio
+    is_embedding = any(kw in feat_folder_lower for kw in ['embed', 'w2v', 'bert', 'hubert', 'wav2vec', 'gpt', 'llama', 'vector', 'vggish'])
 
     if is_embedding:
-        print(f"    [Scalers] Aplicando Normalizer (Embeddings) em: {feature_folder}")
+        print(f"    [Scalers] Aplicando Normalizer (Embeddings/VGGish) em: {feature_folder}")
         scaler = Normalizer()
     else:
         print(f"    [Scalers] Aplicando StandardScaler (Features) em: {feature_folder}")
@@ -122,110 +123,60 @@ def process_single_feature_set(feature_folder, train_ds, test_ds):
         sampler=optuna.samplers.RandomSampler(seed=42),
         pruner=optuna.pruners.MedianPruner(n_startup_trials=5, n_warmup_steps=1)
     )
-    # O X_train que entra aqui já está normalizado uma única vez
     study.optimize(lambda trial: objective(trial, X_train, y_train), n_trials=135)
     # --- FIM DA TUNAGEM ---
 
     # Treinando o modelo final com os melhores parâmetros encontrados
-    clf = DecisionTreeClassifier(**study.best_params, class_weight='balanced', random_state=42)
+    clf = RandomForestClassifier(**study.best_params, class_weight='balanced', random_state=42, n_jobs=-1)
     clf.fit(X_train, y_train)
 
-    classes = clf.classes_
-    try:
-        ad_idx = list(classes).index('AD')
-    except (IndexError, ValueError):
-        return {}, {}
+    # Realizando as predições no conjunto de teste
+    y_pred = clf.predict(X_test)
 
-    probs = clf.predict_proba(X_test)
-    prob_dict = {}
-    label_dict = {}
-    for i in range(len(test_ids)):
-        p_id = test_ids[i]
-        prob_dict[p_id] = probs[i][ad_idx]
-        label_dict[p_id] = 1 if y_test[i] == 'AD' else 0
+    # Conversão das predições textuais em binárias para salvar no CSV no padrão do seu pipeline original
+    pred_bin = [1 if pred == 'AD' else 0 for pred in y_pred]
+    true_bin = [1 if true == 'AD' else 0 for true in y_test]
 
     print(f" [OK] Feature {feature_folder} finalizada!")
-    return prob_dict, label_dict
+    return test_ids, true_bin, pred_bin
 
 def run_pipeline():
-    """Pipeline de Soft Voting Ensemble Paralelizado."""
+    """Pipeline para execução, avaliação e exportação de uma única feature alvo."""
     print("="*70)
-    print("INICIANDO PIPELINE DE ENSEMBLE (PARALELIZADO: DT + OPTUNA 135 TRIALS)")
+    print(f"INICIANDO PIPELINE INDIVIDUAL (RF + OPTUNA 135 TRIALS) para: {FEATURE_TARGET}")
     print("="*70)
+
     if not BASE_FEATURES_DIR.exists():
         print(f"[!] Erro: Diretório base não encontrado: {BASE_FEATURES_DIR}")
         return
 
-    all_features = [f for f in os.listdir(BASE_FEATURES_DIR)
-                    if os.path.isdir(BASE_FEATURES_DIR.joinpath(f))]
-    if not all_features:
-        print("[!] Nenhuma pasta de feature encontrada.")
-        return
+    test_ids, final_ground_truth, final_predictions = process_single_feature_set(FEATURE_TARGET, DATASET_TRAIN, DATA_TEST)
 
-    patient_probs_accumulator = {}
-    true_labels_map = {}
-    features_processed_count = 0
-    all_test_ids = set()
-
-    with ProcessPoolExecutor(max_workers=None) as executor:
-        futures = {
-            executor.submit(process_single_feature_set, feat, DATASET_TRAIN, DATA_TEST): feat
-            for feat in all_features
-        }
-        for future in as_completed(futures):
-            feat = futures[future]
-            try:
-                p_probs, p_labels = future.result()
-                if not p_probs: continue
-                for p_id in p_probs.keys():
-                    all_test_ids.add(p_id)
-                for p_id, prob in p_probs.items():
-                    patient_probs_accumulator.setdefault(p_id, []).append(prob)
-                for p_id, label in p_labels.items():
-                    true_labels_map[p_id] = label
-                features_processed_count += 1
-            except Exception as e:
-                print(f"[!] Erro crítico ao processar a feature '{feat}': {e}")
-
-    # --- ALINHAMENTO E MÉDIA (SOFT VOTING) ---
-    print("\n" + "="*70)
-    print("FASE FINAL: ALINHAMENTO E MÉDIA (SOFT VOTING)")
-    print("="*70)
-    final_predictions, final_ground_truth = [], []
-    ids_intersecao = []
-
-    for p_id in all_test_ids:
-        probs_list = patient_probs_accumulator.get(p_id, [])
-        if len(probs_list) == features_processed_count:
-            avg_prob_ad = np.mean(probs_list)
-            pred_bin = 1 if avg_prob_ad > 0.5 else 0
-            true_val = true_labels_map.get(p_id, -1)
-            if true_val != -1:
-                final_predictions.append(pred_bin)
-                final_ground_truth.append(true_val)
-                ids_intersecao.append(p_id)
-
-    if final_predictions:
+    if test_ids is not None:
+        # --- EXPORTAÇÃO DOS RESULTADOS ---
         df_results = pd.DataFrame({
-            'Patient_ID': ids_intersecao,
+            'Patient_ID': test_ids,
             'True_Label': final_ground_truth,
             'Predicted_Class': final_predictions
         })
-        df_results.to_csv('/home/dani/Documentos/PEP/ensemble_results_dt.csv', index=False)
-        print("[INFO] Resultados exportados com sucesso em 'ensemble_results_dt.csv'!")
 
-        print(f"[INFO] Pacientes na interseção total: {len(ids_intersecao)}")
+        # Sufixo alterado para _RF para manter o histórico organizado
+        output_file = f'/home/dani/Documentos/PEP/single_feature_results_{FEATURE_TARGET}_RF.csv'
+        df_results.to_csv(output_file, index=False)
+        print(f"[INFO] Resultados exportados com sucesso em '{output_file}'!")
+
+        print(f"[INFO] Total de pacientes avaliados: {len(test_ids)}")
         print("\n" + "="*70)
-        print("RESULTADO DO ENSEMBLE (Soft Voting)")
+        print(f"RESULTADO DA FEATURE UNICA ({FEATURE_TARGET})")
         print("="*70)
-        print(f"Acurácia Global do Ensemble: {accuracy_score(final_ground_truth, final_predictions):.4f}")
+        print(f"Acurácia Global: {accuracy_score(final_ground_truth, final_predictions):.4f}")
         print("-" * 70)
         print("Relatório de Classificação:")
         print(classification_report(final_ground_truth, final_predictions,
                                     labels=[0, 1], target_names=['HC', 'AD'], zero_division=0))
         print("="*70)
     else:
-        print("[!] Erro: Nenhum paciente comum encontrado.")
+        print("[!] Erro: Falha ao processar os dados da feature selecionada.")
 
 if __name__ == "__main__":
     run_pipeline()

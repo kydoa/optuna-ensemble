@@ -3,11 +3,10 @@ import numpy as np
 from pathlib import Path
 from sklearn.metrics import classification_report, accuracy_score
 from sklearn.model_selection import cross_val_score, train_test_split
-from sklearn.preprocessing import Normalizer, StandardScaler # IMPORTANTE: Adicionado StandardScaler
+from sklearn.preprocessing import Normalizer, StandardScaler
 from catboost import CatBoostClassifier
 import optuna
 import pandas as pd
-from joblib import Parallel, delayed
 
 # Desativar os logs verbosos do Optuna
 optuna.logging.set_verbosity(optuna.logging.WARNING)
@@ -19,9 +18,12 @@ BASE_FEATURES_DIR = Path('/home/dani/Documentos/PEP/admodel-master-version/data/
 DATASET_TRAIN = 'ADReSSo21_train'
 DATA_TEST = 'ADReSSo21_test'
 
+# Alterado para a feature alvo solicitada
+FEATURE_TARGET = 'trill'
+
 # --- FUNÇÃO DE TUNAGEM (OPTUNA) ---
 def objective(trial, X_train, y_train):
-    """Hyperparameter optimization for CatBoost."""
+    """Otimização de hiperparâmetros para o CatBoost."""
     if len(X_train) < 5:
         return 0.0
     param = {
@@ -33,7 +35,7 @@ def objective(trial, X_train, y_train):
         'verbose': 0,
         'allow_writing_files': False,
         'boost_from_average': True,
-        'thread_count': 1  # Mantém 1 thread por trial para não travar o loop externo paralelo
+        'thread_count': -1  # Uso total de threads para o modelo individual
     }
     clf = CatBoostClassifier(**param)
     try:
@@ -47,6 +49,7 @@ def load_data_for_feature_set(feature_folder, dataset_name):
     target_path = BASE_FEATURES_DIR.joinpath(feature_folder, dataset_name)
     features, labels, ids = [], [], []
     if not target_path.exists():
+        print(f" [!] Caminho inexistente: {target_path}")
         return np.array([]), [], []
     expected_dim = None
     for root, dirs, files in os.walk(target_path):
@@ -82,32 +85,33 @@ def load_data_for_feature_set(feature_folder, dataset_name):
     return np.array(features), np.array(labels), ids
 
 def process_single_feature_set(feature_folder, train_ds, test_ds):
-    """Worker function used by Parallel execution."""
-    print(f"[>] Processing: {feature_folder}")
+    """Trata dados, treina via Optuna e infere predições no conjunto de teste com CatBoost."""
+    print(f"[>] Iniciando processamento da feature: {feature_folder}")
     X_train_full, y_train_full, _ = load_data_for_feature_set(feature_folder, train_ds)
     if len(X_train_full) < 5 or len(np.unique(y_train_full)) < 2:
-        return None
+        print(f" [!] Erro: Sem dados suficientes para {feature_folder}")
+        return None, None, None
 
     X_test, y_test, test_ids = load_data_for_feature_set(feature_folder, test_ds)
     if len(X_test) == 0 or X_test.shape[1] != X_train_full.shape[1]:
-        return None
+        print(f" [!] Erro: Dados de teste ausentes ou incompatíveis para {feature_folder}")
+        return None, None, None
 
     # --- TRATAMENTO E ESCALONAMENTO CONDICIONAL ---
-    # Heurística para detectar se a pasta refere-se a embeddings
     feat_folder_lower = feature_folder.lower()
-    is_embedding = any(kw in feat_folder_lower for kw in ['embed', 'w2v', 'bert', 'hubert', 'wav2vec', 'gpt', 'llama', 'vector'])
+    is_embedding = any(kw in feat_folder_lower for kw in ['embed', 'w2v', 'bert', 'hubert', 'wav2vec', 'gpt', 'llama', 'vector', 'vggish', 'trill'])
 
     if is_embedding:
-        print(f" [Scalers] Aplicando Normalizer para Embeddings em: {feature_folder}")
+        print(f"    [Scalers] Aplicando Normalizer (Embeddings/TRILL) em: {feature_folder}")
         scaler = Normalizer()
     else:
-        print(f" [Scalers] Aplicando StandardScaler para Features em: {feature_folder}")
+        print(f"    [Scalers] Aplicando StandardScaler (Features) em: {feature_folder}")
         scaler = StandardScaler()
 
     X_train_full = scaler.fit_transform(X_train_full)
     X_test = scaler.transform(X_test)
 
-    # Split para o Early Stopping
+    # Split interno para o Early Stopping
     X_train, X_val, y_train, y_val = train_test_split(X_train_full, y_train_full, test_size=0.2, random_state=42)
 
     # Configuração do Estudo do Optuna
@@ -118,109 +122,66 @@ def process_single_feature_set(feature_folder, train_ds, test_ds):
     )
     study.optimize(lambda trial: objective(trial, X_train, y_train), n_trials=135)
 
-    # Treinamento Final
+    # Preparação dos parâmetros finais encontrados
     final_params = study.best_params.copy()
-    if 'und_l2_reg' in final_params:
-        final_params['l2_leaf_reg'] = final_params.pop('und_l2_reg')
     final_params.update({
         'random_seed': 42,
         'verbose': 0,
-        'thread_count': 1,
+        'thread_count': -1,
         'allow_writing_files': False
     })
 
+    # Treinamento final associando a validação ao early stopping de 20 rodadas
     clf = CatBoostClassifier(**final_params)
     clf.fit(X_train, y_train, eval_set=(X_val, y_val), early_stopping_rounds=20, verbose=False)
 
-    classes = clf.classes_
-    try:
-        ad_idx = np.where(classes == 'AD')[0][0]
-    except IndexError:
-        return None
+    # Realizando as predições no conjunto de teste
+    y_pred = clf.predict(X_test)
 
-    probs = clf.predict_proba(X_test)
-    prob_dict, label_dict = {}, {}
-    for i in range(len(test_ids)):
-        p_id = test_ids[i]
-        prob_dict[p_id] = probs[i][ad_idx]
-        label_dict[p_id] = 1 if y_test[i] == 'AD' else 0
+    # Conversão para o formato padrão binário (0 e 1)
+    pred_bin = [1 if pred == 'AD' else 0 for pred in y_pred]
+    true_bin = [1 if true == 'AD' else 0 for true in y_test]
 
-    print(f" [OK] Feature {feature_folder} finalized!")
-    return feature_folder, prob_dict, label_dict
+    print(f" [OK] Feature {feature_folder} finalizada!")
+    return test_ids, true_bin, pred_bin
 
 def run_pipeline():
-    """Main Orchestrator."""
+    """Pipeline para execução, avaliação e exportação de uma única feature alvo."""
     print("="*70)
-    print("INICIANDO PIPELINE DE ENSEMBLE (CATBOOST + OPTUNA 135 TRIALS)")
+    print(f"INICIANDO PIPELINE INDIVIDUAL (CatBoost + OPTUNA 135 TRIALS) para: {FEATURE_TARGET}")
     print("="*70)
 
     if not BASE_FEATURES_DIR.exists():
-        print(f"[!] Error: Directory not found: {BASE_FEATURES_DIR}")
+        print(f"[!] Erro: Diretório base não encontrado: {BASE_FEATURES_DIR}")
         return
 
-    all_features = [f for f in os.listdir(BASE_FEATURES_DIR) if os.path.isdir(BASE_FEATURES_DIR.joinpath(f))]
-    print(f"[INFO] Distributing {len(all_features)} features to CPU cores...")
+    test_ids, final_ground_truth, final_predictions = process_single_feature_set(FEATURE_TARGET, DATASET_TRAIN, DATA_TEST)
 
-    results = Parallel(n_jobs=-1, backend="loky")(
-        delayed(process_single_feature_set)(feat, DATASET_TRAIN, DATA_TEST)
-        for feat in all_features
-    )
-
-    # AGGREGATION PHASE
-    patient_probs_accumulator = {}
-    true_labels_map = {}
-    features_processed_count = 0
-    all_test_ids = set()
-
-    print("\n[INFO] Aggregating results...")
-    for res in results:
-        if res is None: continue
-        feat_name, p_probs, p_labels = res
-        features_processed_count += 1
-        for p_id in p_probs.keys():
-            all_test_ids.add(p_id)
-        for p_id, prob in p_probs.items():
-            patient_probs_accumulator.setdefault(p_id, []).append(prob)
-        for p_id, label in p_labels.items():
-            true_labels_map[p_id] = label
-
-    # FINAL VOTING (Soft Voting)
-    final_predictions, final_ground_truth = [], []
-    ids_intersecao = []
-    for p_id in all_test_ids:
-        probs_list = patient_probs_accumulator.get(p_id, [])
-        if len(probs_list) == features_processed_count:
-            avg_prob_ad = np.mean(probs_list)
-            pred_bin = 1 if avg_prob_ad > 0.5 else 0
-            true_val = true_labels_map.get(p_id, -1)
-            if true_val != -1:
-                final_predictions.append(pred_bin)
-                final_ground_truth.append(true_val)
-                ids_intersecao.append(p_id)
-
-    if final_predictions:
+    if test_ids is not None:
+        # --- EXPORTAÇÃO DOS RESULTADOS ---
         df_results = pd.DataFrame({
-            'Patient_ID': ids_intersecao,
+            'Patient_ID': test_ids,
             'True_Label': final_ground_truth,
             'Predicted_Class': final_predictions
         })
-        df_results.to_csv('/home/dani/Documentos/PEP/ensemble_results_CB.csv', index=False)
-        print("[INFO] Resultados exportados com sucesso em 'ensemble_results_CB.csv'!")
 
-    if not final_predictions:
-        print("[!] Error: No common patients found.")
-        return
+        # Nome do arquivo final configurado com o sufixo _CB
+        output_file = f'/home/dani/Documentos/PEP/single_feature_results_{FEATURE_TARGET}_CB.csv'
+        df_results.to_csv(output_file, index=False)
+        print(f"[INFO] Resultados exportados com sucesso em '{output_file}'!")
 
-    print(f"[INFO] Pacientes na interseção total: {len(ids_intersecao)}")
-    print("\n" + "="*70)
-    print("RESULTADO DO ENSEMBLE (Soft Voting)")
-    print("="*70)
-    print(f"Acurácia Global do Ensemble: {accuracy_score(final_ground_truth, final_predictions):.4f}")
-    print("-" * 70)
-    print("Relatório de Classificação:")
-    print(classification_report(final_ground_truth, final_predictions,
-                                labels=[0, 1], target_names=['HC', 'AD'], zero_division=0))
-    print("="*70)
+        print(f"[INFO] Total de pacientes avaliados: {len(test_ids)}")
+        print("\n" + "="*70)
+        print(f"RESULTADO DA FEATURE UNICA ({FEATURE_TARGET})")
+        print("="*70)
+        print(f"Acurácia Global: {accuracy_score(final_ground_truth, final_predictions):.4f}")
+        print("-" * 70)
+        print("Relatório de Classificação:")
+        print(classification_report(final_ground_truth, final_predictions,
+                                    labels=[0, 1], target_names=['HC', 'AD'], zero_division=0))
+        print("="*70)
+    else:
+        print("[!] Erro: Falha ao processar os dados da feature selecionada.")
 
 if __name__ == "__main__":
     run_pipeline()

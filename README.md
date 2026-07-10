@@ -23,14 +23,33 @@ Each training script loads `.npy` feature matrices from a shared feature directo
 
 `optuna-ensemble` compares several classifiers on the same feature bank and combines their predictions with soft voting.
 
-The main scripts are:
+The main scripts are organized by model and by feature family. For every supported model there are
+pipeline scripts tuned with Optuna; additionally, many models have separate entry-points per feature
+family so you can run or tune a single feature set independently.
 
-- `classify_dt_new_OPTUNA.py`: Decision Tree ensemble pipeline.
-- `classify_dt_RF_new_OPTUNA.py`: Random Forest ensemble pipeline.
-- `classify_dt_SVC_new_OPTUNA.py`: Support Vector Classifier ensemble pipeline.
-- `classify_dt_XGBoost_new_OPTUNA.py`: XGBoost ensemble pipeline.
-- `classify_dt_CatBoost_new_OPTUNA.py`: CatBoost ensemble pipeline.
-- `classify_dt_LightGBM_new_OPTUNA.py`: LightGBM ensemble pipeline.
+Models available (examples):
+
+- Decision Tree (`dt`)
+- Random Forest (`rf`)
+- Support Vector Classifier (`svc`)
+- XGBoost (`xgb`)
+- CatBoost (`cb`)
+- LightGBM (`lgbm`)
+
+Common feature families present as separate scripts (examples):
+
+- `ComParE_2016_6k`
+- `eGeMAPSv02_88`
+- `Lexical_Full`
+- `pAA`
+- `SpeechGraph_Full`
+- `trill`
+- `vggish`
+
+Script naming convention examples:
+
+- `src/classify_<model>_<feature>.py` (e.g. `src/classify_rf_eGeMAPSv02_88.py`)
+- Some models also provide a more generic pipeline entry such as `classify_dt_new_OPTUNA.py`.
 
 Common behavior across the scripts:
 
@@ -116,37 +135,34 @@ The notebook expects files such as:
 
 ```text
 .
-├── README.md                               # Project overview and usage guide
-├── output.png                              # Example graph of finalized results
-├── nb/                                     # Analysis and visualization of results
-│   └── analise_ensemble.ipynb              # Notebook for comparing exported ensemble results
-├── src/                                    # Main pipelines (The processing 'Engine')
-│   ├── classify_dt_new_OPTUNA.py           # Decision Tree + Optuna pipeline
-│   ├── classify_dt_RF_new_OPTUNA.py        # Random Forest + Optuna pipeline
-│   ├── classify_dt_SVC_new_OPTUNA.py       # SVC + Optuna pipeline
-│   ├── classify_dt_XGBoost_new_OPTUNA.py   # XGBoost + Optuna pipeline
-│   ├── classify_dt_CatBoost_new_OPTUNA.py  # CatBoost + Optuna pipeline
-│   └── classify_dt_LightGBM_new_OPTUNA.py  # LightGBM + Optuna pipeline
-├── logs/                                   # Logs from previous runs (for traceability)
-│   ├── logs_OPTUNA.txt
-│   ├── logs_RF_OPTUNA.txt
-│   ├── logs_SVC_OPTUNA.txt
-│   ├── logs_XG_OPTUNA.txt
-│   ├── logs_CB_OPTUNA.txt
-│   └── logs_GBM_OPTUNA.txt
+├── README.md                               				# Project overview and usage guide
+├── output.png                              				# Example graph of finalized results
+├── nb/                                     				# Analysis and visualization of results
+│   └── analise_ensemble.ipynb              				# Notebook for comparing exported ensemble results
+├── src/                                    				# Main pipelines (many per-model and per-feature entrypoints)
+│   ├── classify_rf_eGeMAPSv02_88.py        				# Random Forest on eGeMAPS
+│   ├── classify_xgb_ComParE_2016_6k.py     				# XGBoost on ComParE 6k
+│   ├── classify_lgbm_Lexical_Full.py       				# LightGBM on lexical features
+│   ├── classify_cb_SpeechGraph_Full.py     				# CatBoost on speech-graph features
+│   ├── classify_svc_trill.py               				# SVC on `trill` embeddings
+│   └── (many more `classify_<model>_<feature>.py` files)
+├── logs/                                   				# Logs from previous runs (for traceability)
+│   ├── logs_CB_OPTUNA_OLD.txt
+│   ├── logs_DT_OPTUNA_OLD.txt
+│   ├── logs_GBM_OPTUNA_OLD.txt
+│   ├── logs_RF_OPTUNA_OLD.txt
+│   ├── logs_SVC_OPTUNA_OLD.txt
+│   └── logs_XGB_OPTUNA_OLD.txt
 └── ...
 ```
 
 ### File notes
 
-- `classify_dt_new_OPTUNA.py` is the Decision Tree implementation and writes `ensemble_results_dt.csv`.
-- `classify_dt_RF_new_OPTUNA.py` is the Random Forest implementation and writes `ensemble_results_RF.csv`.
-- `classify_dt_SVC_new_OPTUNA.py` is the SVC implementation and writes `ensemble_results_SVC.csv`.
-- `classify_dt_XGBoost_new_OPTUNA.py` is the XGBoost implementation and writes `ensemble_results_XG.csv`.
-- `classify_dt_CatBoost_new_OPTUNA.py` is the CatBoost implementation and writes `ensemble_results_CB.csv`.
-- `classify_dt_LightGBM_new_OPTUNA.py` is the LightGBM implementation and writes `ensemble_results_GBM.csv`.
-- `analise_ensemble.ipynb` reads those outputs and turns them into summary tables and plots.
-- `logs/` stores example execution logs that can help when comparing runs or troubleshooting.
+- The repository contains many `classify_<model>_<feature>.py` entrypoints. Running one will tune
+	and evaluate that `<model>` on the chosen `<feature>` family and export per-patient CSV results.
+- Output files follow the pattern `ensemble_results_<MODEL>.csv` or `ensemble_results_<MODEL>_<feature>.csv`.
+- `analise_ensemble.ipynb` reads the exported CSVs and turns them into summary tables and plots.
+- `logs/` stores example execution logs (see filenames above) that can help when comparing runs or troubleshooting.
 
 ## Where To Get Help
 

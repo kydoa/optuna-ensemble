@@ -3,7 +3,7 @@ import numpy as np
 from pathlib import Path
 from sklearn.metrics import classification_report, accuracy_score
 from sklearn.model_selection import StratifiedKFold
-from sklearn.feature_selection import VarianceThreshold, SelectKBest, f_classif
+from sklearn.preprocessing import Normalizer, StandardScaler  # IMPORTANTE: Adicionado StandardScaler
 import lightgbm as lgb
 import optuna
 import pandas as pd
@@ -53,10 +53,13 @@ def load_data_for_feature_set(feature_folder, dataset_name):
         for file in files:
             if file.endswith('.npy'):
                 try:
-                    data = np.load(os.path.join(root, file)).flatten()
-                    if len(data) == 0 or np.isnan(data).all():
+                    data = np.load(os.path.join(root, file)).flatten().astype(np.float32)
+
+                    # CORREÇÃO: Sem Imputer. Se houver qualquer valor nulo (NaN), descarta a amostra aqui.
+                    if len(data) == 0 or np.isnan(data).any():
                         skipped += 1
                         continue
+
                     features.append(data)
                     ids.append(Path(file).stem)
                     labels.append(current_label)
@@ -88,7 +91,8 @@ def optimize_hyperparameters(X_train, y_train):
             'colsample_bytree': trial.suggest_float('colsample_bytree', 0.6, 1.0),
         }
 
-        cv = StratifiedKFold(n_splits=3, shuffle=True, random_state=42)
+        # AJUSTADO: cross-validation alterado para n_splits=4 com foco em 'accuracy'
+        cv = StratifiedKFold(n_splits=4, shuffle=True, random_state=42)
         scores = []
 
         for train_idx, val_idx in cv.split(X_train, y_train):
@@ -114,7 +118,7 @@ def optimize_hyperparameters(X_train, y_train):
         pruner=optuna.pruners.MedianPruner(n_startup_trials=5, n_warmup_steps=1)
     )
 
-    # Executa os 135 trials solicitados
+    # Executa os 135 trials solicitados passando os dados escalonados de forma limpa
     study.optimize(objective, n_trials=135, n_jobs=1)
 
     return study.best_params
@@ -132,23 +136,23 @@ def process_single_feature_set(feature_folder, train_ds, test_ds):
     if len(X_test) == 0 or X_test.shape[1] != X_train.shape[1]:
         return None
 
-    # --- DEFENSOR DE ALTA DIMENSIONALIDADE (Prevenção física para o ComParE_2016_6k) ---
-    if X_train.shape[1] > 500:
-        print(f"    [i] High-dim detected ({X_train.shape[1]} features) on {feature_folder}. Applying fast filtering...")
+    # --- TRATAMENTO E ESCALONAMENTO CONDICIONAL DOS DADOS ---
+    # Heurística para detectar se a pasta refere-se a embeddings
+    feat_folder_lower = feature_folder.lower()
+    is_embedding = any(kw in feat_folder_lower for kw in ['embed', 'w2v', 'bert', 'hubert', 'wav2vec', 'gpt', 'llama', 'vector'])
 
-        # 1. Filtro rápido de variância irrelevante
-        selector_var = VarianceThreshold(threshold=0.01)
-        X_train = selector_var.fit_transform(X_train)
-        X_test = selector_var.transform(X_test)
+    if is_embedding:
+        print(f"    [Scalers] Aplicando Normalizer (Embeddings) em: {feature_folder}")
+        scaler = Normalizer()
+    else:
+        print(f"    [Scalers] Aplicando StandardScaler (Features) em: {feature_folder}")
+        scaler = StandardScaler()
 
-        # 2. Seleção ANOVA estatística para reduzir a carga drástica do LightGBM para 200 colunas ótimas
-        k_features = min(200, X_train.shape[1])
-        selector_k = SelectKBest(score_func=f_classif, k=k_features)
-        X_train = selector_k.fit_transform(X_train, y_train)
-        X_test = selector_k.transform(X_test)
-        print(f"    [i] Optimized matrix shape for LightGBM: {X_train.shape}")
+    X_train_transformed = scaler.fit_transform(X_train)
+    X_test_transformed = scaler.transform(X_test)
 
-    best_params = optimize_hyperparameters(X_train, y_train)
+    # Busca os hiperparâmetros enviando a matriz devidamente escalonada
+    best_params = optimize_hyperparameters(X_train_transformed, y_train)
 
     # Atribui threads seguras para o fit de encerramento
     best_params['n_jobs'] = 1
@@ -158,9 +162,9 @@ def process_single_feature_set(feature_folder, train_ds, test_ds):
     y_train_mapped = np.where(y_train == 'AD', 1, 0)
 
     clf = lgb.LGBMClassifier(**best_params)
-    clf.fit(X_train, y_train_mapped)
+    clf.fit(X_train_transformed, y_train_mapped)
 
-    probs = clf.predict_proba(X_test)
+    probs = clf.predict_proba(X_test_transformed)
 
     # LightGBM mapeia internamente as classes ordenadas ([0, 1] mapeia para [0=HC, 1=AD])
     ad_idx = 1
